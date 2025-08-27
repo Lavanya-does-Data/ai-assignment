@@ -1,0 +1,148 @@
+# crowdwisdomtrading_crewai.py
+# Python 3.x
+# CrewAI multi-agent workflow for daily US financial summary
+# Requires: crewai, litellm, requests, matplotlib, yfinance
+
+from crewai import Crew, Agent, Flow
+from litellm import OpenAI
+import requests
+import yfinance as yf
+import matplotlib.pyplot as plt
+from io import BytesIO
+
+# ===============================
+# CONFIGURATION
+# ===============================
+SERPER_API_KEY = "YOUR_SERPER_API_KEY"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+TARGET_LANGUAGES = ["ar", "hi", "he"]  # Arabic, Hindi, Hebrew
+
+llm = OpenAI(model="gpt-4o-mini")  # can replace with any litellm compatible model
+
+# ===============================
+# AGENTS
+# ===============================
+
+# --- Agent 1: Search Agent ---
+class SearchAgent(Agent):
+    def run(self, task_input):
+        # Search last-hour US financial news using Serper API
+        url = "https://google.serper.dev/search"
+        headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+        query = "US financial news past hour"
+        payload = {"q": query, "num": 5}  # top 5 results
+        response = requests.post(url, json=payload, headers=headers)
+        results = []
+        try:
+            data = response.json()
+            for r in data.get("organic", []):
+                results.append({"title": r.get("title"), "link": r.get("link")})
+        except:
+            results.append({"title": "No results", "link": ""})
+        return results
+
+# --- Agent 2: Summary Agent ---
+class SummaryAgent(Agent):
+    def run(self, task_input):
+        # task_input: list of news dicts
+        articles_text = "\n".join([f"{a['title']}: {a['link']}" for a in task_input])
+        prompt = f"""
+        You are a financial analyst. Summarize the following news in less than 500 words,
+        focusing on key market movements and trading activity. Format as plain text.
+
+        News:
+        {articles_text}
+        """
+        summary = llm.complete(prompt)
+        return summary
+
+# --- Agent 3: Formatting Agent ---
+class FormattingAgent(Agent):
+    def run(self, task_input):
+        # task_input: summary text
+        # Fetch real market data for S&P 500 and Nasdaq
+        sp500 = yf.Ticker("^GSPC")
+        nasdaq = yf.Ticker("^IXIC")
+        sp500_hist = sp500.history(period="1d")
+        nasdaq_hist = nasdaq.history(period="1d")
+        
+        # Plotting the data
+        fig, axs = plt.subplots(2, figsize=(10, 8))
+        sp500_hist['Close'].plot(ax=axs[0], title="S&P 500 Closing Price")
+        nasdaq_hist['Close'].plot(ax=axs[1], title="Nasdaq Closing Price")
+        
+        # Save the plots to a BytesIO object
+        buf = BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        image_data = buf.read()
+        buf.close()
+        
+        # Return the summary and the image data
+        return {"summary": task_input, "image_data": image_data}
+
+# --- Agent 4: Translating Agent ---
+class TranslatingAgent(Agent):
+    def run(self, task_input):
+        translations = {}
+        for lang in TARGET_LANGUAGES:
+            prompt = f"Translate the following text to {lang}:\n{task_input}"
+            translations[lang] = llm.complete(prompt)
+        translations["en"] = task_input
+        return translations
+
+# --- Agent 5: Send Agent ---
+class SendAgent(Agent):
+    def run(self, task_input):
+        # task_input: dict with languages and image data
+        for lang, text in task_input.items():
+            if lang == "en":
+                # Send the English summary with the image to Telegram
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": text,
+                    "photo": ("financial_summary.png", task_input["image_data"])
+                }
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", files=payload)
+            else:
+                # Send the translated summaries without images
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": text
+                }
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data=payload)
+        return "Sent to Telegram"
+
+# ===============================
+# FLOW
+# ===============================
+crew = Crew()
+flow = Flow(name="DailyFinancialSummaryFlow")
+
+# Add agents
+search_agent = SearchAgent(name="SearchAgent")
+summary_agent = SummaryAgent(name="SummaryAgent")
+formatting_agent = FormattingAgent(name="FormattingAgent")
+translating_agent = TranslatingAgent(name="TranslatingAgent")
+send_agent = SendAgent(name="SendAgent")
+
+# Connect agents
+flow.add_agent(search_agent)
+flow.add_agent(summary_agent)
+flow.add_agent(formatting_agent)
+flow.add_agent(translating_agent)
+flow.add_agent(send_agent)
+
+flow.connect(search_agent, summary_agent)
+flow.connect(summary_agent, formatting_agent)
+flow.connect(formatting_agent, translating_agent)
+flow.connect(translating_agent, send_agent)
+
+# ===============================
+# RUN
+# ===============================
+if __name__ == "__main__":
+    print("Running Daily Financial Summary Flow...")
+    output = flow.run({})
+    print("Flow completed!")

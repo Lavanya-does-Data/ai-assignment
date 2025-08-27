@@ -1,0 +1,8 @@
+openai
+python-dotenv
+google-api-python-client
+twilio
+reportlab
+deep-translator
+flask
+
